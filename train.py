@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models import ConvAutoencoder
-from utils import MVTecDataset
+from utils import MVTecDataset, CombinedLoss
 
 
 def train_one_epoch(model, train_loader, optimizer, criterion, device):
@@ -146,7 +146,16 @@ def train(args):
     model = model.to(device)
     
     # Loss and optimizer
-    criterion = nn.MSELoss()
+    if args.loss == 'mse':
+        criterion = nn.MSELoss()
+        print("Using MSE loss")
+    elif args.loss == 'ssim':
+        from utils import SSIMLoss
+        criterion = SSIMLoss()
+        print("Using SSIM loss")
+    else:  # combined
+        criterion = CombinedLoss(alpha=args.ssim_weight)
+        print(f"Using Combined loss (MSE + SSIM, alpha={args.ssim_weight})")
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     
     # Learning rate scheduler - reduce LR when loss plateaus
@@ -248,6 +257,11 @@ if __name__ == '__main__':
                         help='Learning rate')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='DataLoader workers')
+    parser.add_argument('--loss', type=str, default='mse',
+                        choices=['mse', 'ssim', 'combined'],
+                        help='Loss function to use')
+    parser.add_argument('--ssim-weight', type=float, default=0.5,
+                        help='Weight for SSIM in combined loss (0-1)')
     
     # Output arguments
     parser.add_argument('--results-dir', type=str, default='./results',
