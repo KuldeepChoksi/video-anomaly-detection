@@ -1,0 +1,7 @@
+AUROC: 0.8913
+
+Per-defect breakdown:
+  broken_large: ANOMALY, n=20, mean_score=0.0048
+  broken_small: ANOMALY, n=22, mean_score=0.0054
+  contamination: ANOMALY, n=21, mean_score=0.0049
+  good: NORMAL, n=20, mean_score=0.0032
