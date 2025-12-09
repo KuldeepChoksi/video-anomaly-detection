@@ -30,12 +30,11 @@ class MVTecDataset(Dataset):
         mask_transform: Optional transform for ground truth masks
     """
     
-    # All available categories in MVTec AD (plus synthetic for testing)
-    CATEGORIES = [
+    # Standard MVTec categories (for reference, but custom categories are also supported)
+    MVTEC_CATEGORIES = [
         'bottle', 'cable', 'capsule', 'carpet', 'grid',
         'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
-        'tile', 'toothbrush', 'transistor', 'wood', 'zipper',
-        'synthetic'  # For development/testing without real data
+        'tile', 'toothbrush', 'transistor', 'wood', 'zipper'
     ]
     
     def __init__(
@@ -52,9 +51,14 @@ class MVTecDataset(Dataset):
         self.split = split
         self.image_size = image_size
         
-        # Validate category
-        if category not in self.CATEGORIES:
-            raise ValueError(f"Category must be one of {self.CATEGORIES}")
+        # Check if category folder exists (supports any custom category)
+        category_path = self.root_dir / category
+        if not category_path.exists():
+            raise ValueError(f"Category folder not found: {category_path}\n"
+                           f"Please create the folder structure:\n"
+                           f"  {category_path}/train/good/\n"
+                           f"  {category_path}/test/good/\n"
+                           f"  {category_path}/test/<defect_type>/")
         
         # Default transforms if none provided
         if transform is None:
