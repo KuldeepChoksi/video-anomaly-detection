@@ -3,7 +3,11 @@ Anomaly Detection - Interactive Application
 Developed by Kuldeep Choksi
 
 A user-friendly interface for training, evaluating, and using
-anomaly detection models on industrial images.
+anomaly detection models on industrial images AND videos.
+
+Supports:
+- Image anomaly detection (MVTec AD, custom datasets)
+- Video/temporal anomaly detection (IPAD, custom video datasets)
 
 Run with: python main.py
 Then open http://localhost:7860 in your browser.
@@ -30,6 +34,7 @@ class AppState:
     """Holds application state across UI interactions."""
     def __init__(self):
         self.model = None
+        self.video_model = None
         self.device = self._get_device()
         self.checkpoint_path = None
         self.data_dir = "./data/original"
@@ -49,7 +54,7 @@ state = AppState()
 # HELPER FUNCTIONS
 # ============================================================================
 
-def get_available_checkpoints():
+def get_available_checkpoints(model_type="image"):
     """Scan results folder for available model checkpoints."""
     results_dir = Path("./results")
     if not results_dir.exists():
@@ -60,24 +65,26 @@ def get_available_checkpoints():
         if folder.is_dir():
             best_model = folder / "best_model.pth"
             if best_model.exists():
-                checkpoints.append(str(best_model))
+                # Filter by model type
+                if model_type == "video" and "video_" in folder.name:
+                    checkpoints.append(str(best_model))
+                elif model_type == "image" and "video_" not in folder.name:
+                    checkpoints.append(str(best_model))
+                elif model_type == "all":
+                    checkpoints.append(str(best_model))
     return checkpoints
 
 
 def get_available_categories():
-    """Scan data folder for available categories (including custom ones)."""
+    """Scan data folder for available image categories."""
     categories = []
-    
-    # Check both ./data and ./data/original
     data_dirs = [Path("./data"), Path("./data/original")]
     
     for data_dir in data_dirs:
         if not data_dir.exists():
             continue
-        
         for folder in sorted(data_dir.iterdir()):
             if folder.is_dir() and (folder / "train").exists():
-                # Valid category folder found
                 cat_name = folder.name
                 if cat_name not in categories:
                     categories.append(cat_name)
@@ -85,8 +92,40 @@ def get_available_categories():
     return categories if categories else ["No datasets found - see Help tab"]
 
 
+def get_available_video_categories():
+    """Scan data folder for available video categories (IPAD format)."""
+    categories = []
+    
+    # Check IPAD folder
+    ipad_dir = Path("./data/IPAD")
+    if ipad_dir.exists():
+        for folder in sorted(ipad_dir.iterdir()):
+            if folder.is_dir() and (folder / "training" / "frames").exists():
+                categories.append(folder.name)
+    
+    # Check for custom video datasets in ./data
+    data_dir = Path("./data")
+    if data_dir.exists():
+        for folder in sorted(data_dir.iterdir()):
+            if folder.is_dir() and folder.name != "IPAD" and folder.name != "original":
+                if (folder / "train").exists():
+                    # Check if it has video structure
+                    train_dir = folder / "train"
+                    for sub in train_dir.iterdir():
+                        if sub.is_dir():
+                            # Check for video files or frame folders
+                            has_videos = any(f.suffix in ['.mp4', '.avi', '.mov'] for f in sub.iterdir() if f.is_file())
+                            has_frames = any(f.is_dir() for f in sub.iterdir())
+                            if has_videos or has_frames:
+                                if folder.name not in categories:
+                                    categories.append(folder.name)
+                                break
+    
+    return categories if categories else ["No video datasets found - see Help tab"]
+
+
 def load_model_from_checkpoint(checkpoint_path):
-    """Load a trained model from checkpoint."""
+    """Load a trained image model from checkpoint."""
     if not checkpoint_path or not Path(checkpoint_path).exists():
         return None, "Error: Checkpoint file not found."
     
@@ -107,10 +146,60 @@ def load_model_from_checkpoint(checkpoint_path):
         epoch = checkpoint.get('epoch', 'unknown')
         train_loss = checkpoint.get('train_loss', 0)
         
-        return         model, f"Model loaded successfully.\n\nDetails:\n- Epoch: {epoch}\n- Training Loss: {train_loss:.6f}\n- Category: {state.category}\n- Device: {state.device}\n\nModel developed by Kuldeep Choksi"
+        return model, f"""Model loaded successfully.
+
+Details:
+- Epoch: {epoch}
+- Training Loss: {train_loss:.6f}
+- Category: {state.category}
+- Device: {state.device}
+
+Model developed by Kuldeep Choksi"""
     
     except Exception as e:
         return None, f"Error loading model: {str(e)}"
+
+
+def load_video_model_from_checkpoint(checkpoint_path):
+    """Load a trained video model from checkpoint."""
+    if not checkpoint_path or not Path(checkpoint_path).exists():
+        return None, "Error: Checkpoint file not found."
+    
+    try:
+        from models.video_autoencoder import VideoAutoencoder
+        
+        checkpoint = torch.load(checkpoint_path, map_location=state.device, weights_only=False)
+        args = checkpoint.get('args', {})
+        
+        model = VideoAutoencoder(
+            in_channels=3,
+            latent_dim=args.get('latent_dim', 128),
+            lstm_hidden_dim=args.get('lstm_hidden_dim', 128),
+            lstm_num_layers=args.get('lstm_layers', 2)
+        )
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(state.device)
+        model.eval()
+        
+        state.video_model = model
+        
+        epoch = checkpoint.get('epoch', 'unknown')
+        separation = checkpoint.get('separation', 0)
+        category = args.get('category', 'unknown')
+        
+        return model, f"""Video model loaded successfully.
+
+Details:
+- Epoch: {epoch}
+- Separation Ratio: {separation:.2f}x
+- Category: {category}
+- Device: {state.device}
+- Sequence Length: {args.get('sequence_length', 16)} frames
+
+Model developed by Kuldeep Choksi"""
+    
+    except Exception as e:
+        return None, f"Error loading video model: {str(e)}"
 
 
 def preprocess_image(image):
@@ -158,13 +247,13 @@ def create_error_heatmap(error_map):
 
 
 # ============================================================================
-# UI CALLBACK FUNCTIONS
+# IMAGE ANALYSIS CALLBACKS
 # ============================================================================
 
 def on_load_model(checkpoint_dropdown):
     """Callback when user clicks Load Model button."""
     if not checkpoint_dropdown:
-        return "Please select a checkpoint from the dropdown first.\n\nIf no checkpoints appear, you need to train a model first. Go to the Training tab."
+        return "Please select a checkpoint from the dropdown first."
     
     model, message = load_model_from_checkpoint(checkpoint_dropdown)
     return message
@@ -173,30 +262,24 @@ def on_load_model(checkpoint_dropdown):
 def on_analyze_image(input_image):
     """Callback when user uploads an image for analysis."""
     if state.model is None:
-        return None, None, "Please load a model first.\n\nStep 1: Go to 'Model Setup' section above\nStep 2: Select a checkpoint from the dropdown\nStep 3: Click 'Load Model'\nStep 4: Return here and upload an image"
+        return None, None, "Please load a model first."
     
     if input_image is None:
-        return None, None, "Please upload an image to analyze.\n\nSupported formats: PNG, JPG, JPEG\nRecommended: Use images similar to training data (e.g., bottle images from MVTec)"
+        return None, None, "Please upload an image to analyze."
     
     try:
-        # Preprocess
         input_tensor = preprocess_image(input_image).to(state.device)
         
-        # Get reconstruction and error
         with torch.no_grad():
             reconstruction = state.model(input_tensor)
             error_map = state.model.get_reconstruction_error(input_tensor, per_pixel=True)
             error_score = state.model.get_reconstruction_error(input_tensor, per_pixel=False)
         
-        # Convert to displayable images
         recon_image = denormalize(reconstruction)
         heatmap_image = create_error_heatmap(error_map)
         
-        # Generate analysis report
         score = error_score.item()
-        
-        # Determine anomaly status (threshold based on typical values)
-        threshold = 0.004  # Adjust based on your model's performance
+        threshold = 0.004
         is_anomaly = score > threshold
         status = "ANOMALY DETECTED" if is_anomaly else "NORMAL"
         confidence = min(abs(score - threshold) / threshold * 100, 100)
@@ -212,45 +295,135 @@ Confidence: {confidence:.1f}%
 {'='*60}
 INTERPRETATION
 
-The anomaly score represents reconstruction error.
-- Lower scores indicate the image matches learned normal patterns
-- Higher scores indicate deviations from normal patterns
-
-{"WARNING: The image shows characteristics that differ from normal samples. This may indicate a defect or anomaly." if is_anomaly else "The image appears to match normal patterns learned during training."}
-
-{'='*60}
-NEXT STEPS
-
-{"- Inspect the error heatmap to locate the anomaly region\n- Red/yellow areas indicate where reconstruction failed\n- Compare with the original to identify the defect" if is_anomaly else "- The model successfully reconstructed this image\n- Low error across the image indicates normal patterns\n- You may want to test with known defective images to validate"}
+{"WARNING: Anomaly detected." if is_anomaly else "Image appears normal."}
 """
         
         return recon_image, heatmap_image, report
         
     except Exception as e:
-        return None, None, f"Error during analysis: {str(e)}\n\nPlease ensure your image is valid and try again."
+        return None, None, f"Error during analysis: {str(e)}"
 
+
+# ============================================================================
+# VIDEO ANALYSIS CALLBACKS
+# ============================================================================
+
+def on_load_video_model(checkpoint_dropdown):
+    """Load a video model."""
+    if not checkpoint_dropdown:
+        return "Please select a video model checkpoint first."
+    
+    model, message = load_video_model_from_checkpoint(checkpoint_dropdown)
+    return message
+
+
+def on_analyze_video(video_path):
+    """Analyze uploaded video for anomalies."""
+    if state.video_model is None:
+        return None, "Please load a video model first."
+    
+    if video_path is None:
+        return None, "Please upload a video file."
+    
+    try:
+        from utils.video_dataset import VideoFileDataset
+        from torch.utils.data import DataLoader
+        import cv2
+        
+        # Create dataset from uploaded video
+        dataset = VideoFileDataset(
+            video_path=video_path,
+            sequence_length=16,
+            stride=8
+        )
+        
+        if len(dataset) == 0:
+            return None, "Video too short for analysis (need at least 16 frames)."
+        
+        loader = DataLoader(dataset, batch_size=1, shuffle=False)
+        
+        all_scores = []
+        frame_results = []
+        
+        with torch.no_grad():
+            for batch in loader:
+                frames = batch['frames'].to(state.device)
+                frame_scores = state.video_model.get_reconstruction_error(frames, per_frame=True)
+                all_scores.extend(frame_scores[0].cpu().numpy())
+        
+        # Create score timeline plot
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.plot(all_scores, 'b-', linewidth=1)
+        ax.axhline(y=np.mean(all_scores) + 2*np.std(all_scores), color='r', linestyle='--', label='Threshold')
+        ax.set_xlabel('Frame')
+        ax.set_ylabel('Anomaly Score')
+        ax.set_title('Video Anomaly Score Timeline - Kuldeep Choksi')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150)
+        buf.seek(0)
+        plt.close()
+        
+        timeline_image = Image.open(buf)
+        
+        # Generate report
+        mean_score = np.mean(all_scores)
+        max_score = np.max(all_scores)
+        threshold = mean_score + 2*np.std(all_scores)
+        anomaly_frames = np.where(np.array(all_scores) > threshold)[0]
+        
+        report = f"""VIDEO ANALYSIS COMPLETE - Kuldeep Choksi's Anomaly Detection System
+{'='*60}
+
+Video Statistics:
+- Total Frames Analyzed: {len(all_scores)}
+- Mean Anomaly Score: {mean_score:.6f}
+- Max Anomaly Score: {max_score:.6f}
+- Threshold (mean + 2*std): {threshold:.6f}
+
+Anomaly Detection:
+- Frames Above Threshold: {len(anomaly_frames)}
+- Anomaly Percentage: {100*len(anomaly_frames)/len(all_scores):.1f}%
+
+{'='*60}
+"""
+        if len(anomaly_frames) > 0:
+            report += f"\nPotential anomaly frames: {anomaly_frames[:20].tolist()}"
+            if len(anomaly_frames) > 20:
+                report += f"\n... and {len(anomaly_frames)-20} more"
+        else:
+            report += "\nNo significant anomalies detected."
+        
+        return timeline_image, report
+        
+    except Exception as e:
+        return None, f"Error analyzing video: {str(e)}"
+
+
+# ============================================================================
+# TRAINING CALLBACKS
+# ============================================================================
 
 def on_start_training(category, epochs, batch_size, learning_rate, loss_type):
-    """Callback when user starts training - yields live progress updates."""
+    """Start image model training."""
     import subprocess
     import sys
     
-    # Validate inputs
     if not category or category == "No datasets found - see Help tab":
-        yield "Error: No dataset found.\n\nPlease add your data following the folder structure in the Help tab."
+        yield "Error: No dataset found."
         return
     
-    # Determine correct data directory
-    # Check if category exists in ./data or ./data/original
     if (Path("./data") / category / "train").exists():
         data_dir = "./data"
     elif (Path("./data/original") / category / "train").exists():
         data_dir = "./data/original"
     else:
-        yield f"Error: Could not find dataset for '{category}'.\n\nMake sure the folder structure is correct:\n  data/{category}/train/good/\n\nSee Help tab for details."
+        yield f"Error: Could not find dataset for '{category}'."
         return
     
-    # Build command
     cmd = [
         sys.executable, "train.py",
         "--category", category,
@@ -266,69 +439,99 @@ def on_start_training(category, epochs, batch_size, learning_rate, loss_type):
 
 Configuration:
 - Category: {category}
-- Data Directory: {data_dir}
 - Epochs: {int(epochs)}
 - Batch Size: {int(batch_size)}
-- Learning Rate: {learning_rate}
-- Loss Function: {loss_type}
+- Loss: {loss_type}
 
 {'='*60}
-LIVE TRAINING OUTPUT:
-{'='*60}
-
 """
     
     yield header + "Initializing...\n"
     
     try:
-        process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT, 
-            text=True,
-            bufsize=1
-        )
-        
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         output_lines = []
         
         for line in process.stdout:
             line = line.strip()
             if line:
                 output_lines.append(line)
-                # Keep last 40 lines for display
                 display_lines = output_lines[-40:]
                 yield header + '\n'.join(display_lines)
         
         process.wait()
-        
-        # Final output
-        final_output = '\n'.join(output_lines[-40:])
-        
-        yield f"""{header}{final_output}
-
-{'='*60}
-TRAINING COMPLETE
-{'='*60}
-
-Your model has been saved to the results/ folder.
-
-NEXT STEPS:
-1. Go to the 'Analyze Images' tab
-2. Click 'Refresh List' next to the checkpoint dropdown
-3. Select your new model (most recent timestamp)
-4. Upload images to analyze for anomalies
-"""
+        yield header + '\n'.join(output_lines[-40:]) + "\n\nTRAINING COMPLETE"
     except Exception as e:
         yield f"Error during training: {str(e)}"
 
 
-def on_refresh_checkpoints():
-    """Refresh the checkpoint dropdown."""
-    return gr.Dropdown(choices=get_available_checkpoints())
+def on_start_video_training(category, epochs, batch_size, learning_rate):
+    """Start video model training."""
+    import subprocess
+    import sys
+    
+    if not category or category == "No video datasets found - see Help tab":
+        yield "Error: No video dataset found."
+        return
+    
+    # Determine data directory
+    if (Path("./data/IPAD") / category / "training" / "frames").exists():
+        data_dir = "./data/IPAD"
+    elif (Path("./data") / category / "train").exists():
+        data_dir = "./data"
+    else:
+        yield f"Error: Could not find video dataset for '{category}'."
+        return
+    
+    cmd = [
+        sys.executable, "train_video.py",
+        "--category", category,
+        "--data-dir", data_dir,
+        "--epochs", str(int(epochs)),
+        "--batch-size", str(int(batch_size)),
+        "--lr", str(learning_rate)
+    ]
+    
+    header = f"""VIDEO TRAINING STARTED - Kuldeep Choksi's Anomaly Detection System
+{'='*60}
 
+Configuration:
+- Category: {category}
+- Data Directory: {data_dir}
+- Epochs: {int(epochs)}
+- Batch Size: {int(batch_size)}
+- Learning Rate: {learning_rate}
+
+*** Saving based on SEPARATION RATIO (not loss) ***
+
+{'='*60}
+"""
+    
+    yield header + "Initializing...\n"
+    
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        output_lines = []
+        
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                output_lines.append(line)
+                display_lines = output_lines[-40:]
+                yield header + '\n'.join(display_lines)
+        
+        process.wait()
+        yield header + '\n'.join(output_lines[-40:]) + "\n\nTRAINING COMPLETE"
+    except Exception as e:
+        yield f"Error during training: {str(e)}"
+
+
+# ============================================================================
+# RESULTS CALLBACKS
+# ============================================================================
 
 def on_view_results(checkpoint_path):
-    """Load and display evaluation results for a checkpoint."""
+    """Load and display evaluation results."""
     if not checkpoint_path:
         return None, None, None, "Please select a checkpoint first."
     
@@ -336,15 +539,8 @@ def on_view_results(checkpoint_path):
     eval_dir = checkpoint_dir / "evaluation"
     
     if not eval_dir.exists():
-        return None, None, None, f"""No evaluation results found for this model.
-
-Click 'Run Evaluation' to generate results automatically.
-
-Or run from terminal:
-   python evaluate.py --checkpoint {checkpoint_path} --data-dir {state.data_dir}
-"""
+        return None, None, None, f"No evaluation results found. Run evaluation first."
     
-    # Load images
     roc_path = eval_dir / "roc_curve.png"
     dist_path = eval_dir / "score_distribution.png"
     recon_path = eval_dir / "reconstructions.png"
@@ -354,105 +550,63 @@ Or run from terminal:
     dist_img = Image.open(dist_path) if dist_path.exists() else None
     recon_img = Image.open(recon_path) if recon_path.exists() else None
     
-    # Load text results
     if results_path.exists():
         with open(results_path, 'r') as f:
             results_text = f.read()
     else:
         results_text = "No results.txt found."
     
-    summary = f"""EVALUATION RESULTS - Kuldeep Choksi's Anomaly Detection System
-{'='*60}
-
-{results_text}
-
-{'='*60}
-Files saved at: {eval_dir}
-"""
-    
-    return roc_img, dist_img, recon_img, summary
+    return roc_img, dist_img, recon_img, results_text
 
 
 def on_run_evaluation(checkpoint_path):
-    """Run evaluation on selected model and return results."""
+    """Run evaluation on selected model."""
     import subprocess
     import sys
     
     if not checkpoint_path:
         return "Please select a checkpoint first.", None, None, None, ""
     
-    checkpoint_dir = Path(checkpoint_path).parent
+    # Determine if video or image model
+    is_video = "video_" in checkpoint_path
     
-    # Get category from checkpoint
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        category = checkpoint.get('args', {}).get('category', 'bottle')
-    except:
-        category = 'bottle'
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    category = checkpoint.get('args', {}).get('category', 'bottle')
     
-    # Determine correct data directory
-    if (Path("./data") / category / "train").exists():
-        data_dir = "./data"
-    elif (Path("./data/original") / category / "train").exists():
-        data_dir = "./data/original"
+    # Determine data directory
+    if is_video:
+        if (Path("./data/IPAD") / category / "training").exists():
+            data_dir = "./data/IPAD"
+        else:
+            data_dir = "./data"
+        eval_script = "evaluate_video.py"
     else:
-        return f"Error: Could not find dataset for '{category}'.", None, None, None, ""
+        if (Path("./data") / category / "train").exists():
+            data_dir = "./data"
+        elif (Path("./data/original") / category / "train").exists():
+            data_dir = "./data/original"
+        else:
+            return f"Error: Dataset not found for {category}", None, None, None, ""
+        eval_script = "evaluate.py"
     
-    status = f"""RUNNING EVALUATION - Kuldeep Choksi's Anomaly Detection System
-{'='*60}
-
-Model: {checkpoint_path}
-Category: {category}
-Data Directory: {data_dir}
-
-Running evaluation on test set...
-"""
+    cmd = [sys.executable, eval_script, "--checkpoint", checkpoint_path, "--data-dir", data_dir, "--category", category]
     
-    # Build command
-    cmd = [
-        sys.executable, "evaluate.py",
-        "--checkpoint", checkpoint_path,
-        "--data-dir", data_dir,
-        "--category", category
-    ]
+    status = f"Running evaluation on {category}...\n\n"
     
     try:
-        # Run evaluation
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-        
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         output_lines = []
         for line in process.stdout:
             output_lines.append(line.strip())
-        
         process.wait()
         
-        eval_output = '\n'.join(output_lines)
+        status += '\n'.join(output_lines) + "\n\nEVALUATION COMPLETE"
         
-        status += f"""
-{'='*60}
-EVALUATION OUTPUT:
-{'='*60}
-
-{eval_output}
-
-{'='*60}
-EVALUATION COMPLETE
-
-Results are now available below.
-"""
-        
-        # Load the generated results
         roc_img, dist_img, recon_img, summary = on_view_results(checkpoint_path)
-        
         return status, roc_img, dist_img, recon_img, summary
         
     except Exception as e:
-        return f"Error running evaluation: {str(e)}", None, None, None, ""
+        return f"Error: {str(e)}", None, None, None, ""
 
 
 # ============================================================================
@@ -464,20 +618,13 @@ def create_ui():
     
     with gr.Blocks(title="Anomaly Detection System") as app:
         
-        # Header
         gr.Markdown("""
         # Industrial Anomaly Detection System
         **Developed by Kuldeep Choksi**
         
-        This application detects manufacturing defects in images using deep learning.
-        The model learns what "normal" looks like, then flags anything that deviates from normal patterns.
+        Detect manufacturing defects in **images** and **videos** using deep learning.
         
         ---
-        
-        **Getting Started:**
-        1. If you have a trained model, go to **Analyze Images** tab
-        2. If you need to train a model first, go to **Train Model** tab
-        3. To view past results, go to **View Results** tab
         """)
         
         with gr.Tabs():
@@ -486,232 +633,135 @@ def create_ui():
             # TAB 1: ANALYZE IMAGES
             # =================================================================
             with gr.Tab("Analyze Images"):
-                gr.Markdown("""
-                ## Analyze Images for Anomalies
-                *Module developed by Kuldeep Choksi*
+                gr.Markdown("## Image Anomaly Detection\n*Developed by Kuldeep Choksi*")
                 
-                Upload an image to check if it contains defects. The system will:
-                - Reconstruct the image using the learned normal patterns
-                - Generate an error heatmap showing where anomalies may exist
-                - Provide an anomaly score and interpretation
-                
-                ---
-                """)
-                
-                # Model Setup Section
                 gr.Markdown("### Step 1: Load a Model")
                 with gr.Row():
-                    with gr.Column(scale=3):
-                        checkpoint_dropdown = gr.Dropdown(
-                            choices=get_available_checkpoints(),
-                            label="Select Trained Model",
-                            info="Choose a previously trained model checkpoint"
-                        )
-                    with gr.Column(scale=1):
-                        refresh_btn = gr.Button("Refresh List", variant="secondary")
-                        load_btn = gr.Button("Load Model", variant="primary")
+                    checkpoint_dropdown = gr.Dropdown(
+                        choices=get_available_checkpoints("image"),
+                        label="Select Image Model"
+                    )
+                    refresh_btn = gr.Button("Refresh", variant="secondary")
+                    load_btn = gr.Button("Load Model", variant="primary")
                 
-                model_status = gr.Textbox(
-                    label="Model Status",
-                    lines=6,
-                    value="No model loaded.\n\nSelect a checkpoint above and click 'Load Model' to begin.\n\nIf no checkpoints appear, go to the 'Train Model' tab first."
-                )
+                model_status = gr.Textbox(label="Model Status", lines=6, value="No model loaded.")
                 
-                gr.Markdown("---")
-                gr.Markdown("### Step 2: Upload and Analyze Image")
-                
+                gr.Markdown("### Step 2: Upload and Analyze")
                 with gr.Row():
-                    with gr.Column():
-                        input_image = gr.Image(
-                            label="Upload Image",
-                            type="pil",
-                            sources=["upload", "clipboard"]
-                        )
-                        analyze_btn = gr.Button("Analyze Image", variant="primary", size="lg")
-                        
-                        gr.Markdown("""
-                        **Tips:**
-                        - Use images similar to training data
-                        - Supported formats: PNG, JPG, JPEG
-                        - Image will be resized to 256x256
-                        """)
-                    
-                    with gr.Column():
-                        reconstruction_output = gr.Image(label="Reconstruction")
-                    
-                    with gr.Column():
-                        heatmap_output = gr.Image(label="Error Heatmap")
+                    input_image = gr.Image(label="Upload Image", type="pil")
+                    reconstruction_output = gr.Image(label="Reconstruction")
+                    heatmap_output = gr.Image(label="Error Heatmap")
                 
-                analysis_report = gr.Textbox(
-                    label="Analysis Report",
-                    lines=20,
-                    value="Upload an image and click 'Analyze Image' to see results here."
-                )
+                analyze_btn = gr.Button("Analyze Image", variant="primary", size="lg")
+                analysis_report = gr.Textbox(label="Analysis Report", lines=15)
                 
-                # Wire up callbacks
-                refresh_btn.click(
-                    fn=lambda: gr.Dropdown(choices=get_available_checkpoints()),
-                    outputs=checkpoint_dropdown
-                )
+                refresh_btn.click(fn=lambda: gr.Dropdown(choices=get_available_checkpoints("image")), outputs=checkpoint_dropdown)
                 load_btn.click(fn=on_load_model, inputs=checkpoint_dropdown, outputs=model_status)
-                analyze_btn.click(
-                    fn=on_analyze_image,
-                    inputs=input_image,
-                    outputs=[reconstruction_output, heatmap_output, analysis_report]
-                )
+                analyze_btn.click(fn=on_analyze_image, inputs=input_image, outputs=[reconstruction_output, heatmap_output, analysis_report])
             
             # =================================================================
-            # TAB 2: TRAIN MODEL
+            # TAB 2: ANALYZE VIDEO
             # =================================================================
-            with gr.Tab("Train Model"):
-                gr.Markdown("""
-                ## Train a New Model
-                *Training pipeline developed by Kuldeep Choksi*
+            with gr.Tab("Analyze Video"):
+                gr.Markdown("## Video Anomaly Detection\n*Developed by Kuldeep Choksi*")
                 
-                Train an anomaly detection model on your dataset. The model will learn
-                to reconstruct normal images, enabling it to detect anomalies as reconstruction failures.
+                gr.Markdown("### Step 1: Load a Video Model")
+                with gr.Row():
+                    video_checkpoint_dropdown = gr.Dropdown(
+                        choices=get_available_checkpoints("video"),
+                        label="Select Video Model"
+                    )
+                    video_refresh_btn = gr.Button("Refresh", variant="secondary")
+                    video_load_btn = gr.Button("Load Model", variant="primary")
                 
-                ---
+                video_model_status = gr.Textbox(label="Model Status", lines=6, value="No video model loaded.")
                 
-                ### Prerequisites
+                gr.Markdown("### Step 2: Upload and Analyze Video")
+                video_input = gr.Video(label="Upload Video")
+                video_analyze_btn = gr.Button("Analyze Video", variant="primary", size="lg")
                 
-                Before training, ensure you have:
-                1. Downloaded the MVTec AD dataset (or your own data)
-                2. Extracted it to `./data/original/` folder
-                3. Your data folder structure should look like:
-                ```
-                data/original/
-                    bottle/
-                        train/good/
-                        test/good/
-                        test/broken_large/
-                        ...
-                ```
+                timeline_output = gr.Image(label="Anomaly Score Timeline")
+                video_report = gr.Textbox(label="Analysis Report", lines=15)
                 
-                ---
-                """)
-                
-                gr.Markdown("### Training Configuration")
+                video_refresh_btn.click(fn=lambda: gr.Dropdown(choices=get_available_checkpoints("video")), outputs=video_checkpoint_dropdown)
+                video_load_btn.click(fn=on_load_video_model, inputs=video_checkpoint_dropdown, outputs=video_model_status)
+                video_analyze_btn.click(fn=on_analyze_video, inputs=video_input, outputs=[timeline_output, video_report])
+            
+            # =================================================================
+            # TAB 3: TRAIN IMAGE MODEL
+            # =================================================================
+            with gr.Tab("Train Image Model"):
+                gr.Markdown("## Train Image Anomaly Detection Model\n*Developed by Kuldeep Choksi*")
                 
                 with gr.Row():
                     with gr.Column():
-                        category_dropdown = gr.Dropdown(
-                            choices=get_available_categories(),
-                            value="bottle",
-                            label="Dataset Category",
-                            info="Select which type of object to train on"
-                        )
-                        epochs_slider = gr.Slider(
-                            minimum=10, maximum=200, value=50, step=10,
-                            label="Number of Epochs",
-                            info="More epochs = better learning, but longer training"
-                        )
-                        batch_slider = gr.Slider(
-                            minimum=4, maximum=64, value=16, step=4,
-                            label="Batch Size",
-                            info="Lower if you run out of memory"
-                        )
-                    
+                        category_dropdown = gr.Dropdown(choices=get_available_categories(), value="bottle", label="Dataset Category")
+                        epochs_slider = gr.Slider(minimum=10, maximum=200, value=50, step=10, label="Epochs")
+                        batch_slider = gr.Slider(minimum=4, maximum=64, value=16, step=4, label="Batch Size")
                     with gr.Column():
-                        lr_dropdown = gr.Dropdown(
-                            choices=[0.0001, 0.0005, 0.001, 0.005],
-                            value=0.001,
-                            label="Learning Rate",
-                            info="0.001 is a good default"
-                        )
-                        loss_dropdown = gr.Dropdown(
-                            choices=["mse", "ssim", "combined"],
-                            value="mse",
-                            label="Loss Function",
-                            info="MSE recommended - performs best on MVTec"
-                        )
-                
-                gr.Markdown("---")
+                        lr_dropdown = gr.Dropdown(choices=[0.0001, 0.0005, 0.001, 0.005], value=0.001, label="Learning Rate")
+                        loss_dropdown = gr.Dropdown(choices=["mse", "ssim", "combined"], value="mse", label="Loss Function")
                 
                 train_btn = gr.Button("Start Training", variant="primary", size="lg")
+                training_output = gr.Textbox(label="Training Status", lines=25)
                 
-                gr.Markdown("""
-                **Note:** Training will run in the foreground. The interface may be unresponsive
-                until training completes. Check the terminal for live progress.
-                """)
-                
-                training_output = gr.Textbox(
-                    label="Training Status",
-                    lines=25,
-                    value="Configure your training parameters above and click 'Start Training'.\n\nEstimated time: 25-50 minutes for 50 epochs on Apple Silicon."
-                )
-                
-                # Wire up callbacks
-                train_btn.click(
-                    fn=on_start_training,
-                    inputs=[category_dropdown, epochs_slider, batch_slider, lr_dropdown, loss_dropdown],
-                    outputs=training_output
-                )
+                train_btn.click(fn=on_start_training, inputs=[category_dropdown, epochs_slider, batch_slider, lr_dropdown, loss_dropdown], outputs=training_output)
             
             # =================================================================
-            # TAB 3: VIEW RESULTS
+            # TAB 4: TRAIN VIDEO MODEL
+            # =================================================================
+            with gr.Tab("Train Video Model"):
+                gr.Markdown("## Train Video Anomaly Detection Model\n*Developed by Kuldeep Choksi*")
+                
+                gr.Markdown("""
+                Train a ConvLSTM model on video sequences. The model learns temporal patterns
+                of normal operation and detects anomalies as deviations from these patterns.
+                
+                **Note:** Training saves based on separation ratio (not loss) to ensure best anomaly detection.
+                """)
+                
+                with gr.Row():
+                    with gr.Column():
+                        video_category = gr.Dropdown(choices=get_available_video_categories(), label="Video Dataset")
+                        video_epochs = gr.Slider(minimum=5, maximum=50, value=10, step=5, label="Epochs")
+                    with gr.Column():
+                        video_batch = gr.Slider(minimum=2, maximum=16, value=4, step=2, label="Batch Size")
+                        video_lr = gr.Dropdown(choices=[0.0001, 0.0005, 0.001], value=0.0001, label="Learning Rate")
+                
+                video_train_btn = gr.Button("Start Video Training", variant="primary", size="lg")
+                video_training_output = gr.Textbox(label="Training Status", lines=25)
+                
+                video_train_btn.click(fn=on_start_video_training, inputs=[video_category, video_epochs, video_batch, video_lr], outputs=video_training_output)
+            
+            # =================================================================
+            # TAB 5: VIEW RESULTS
             # =================================================================
             with gr.Tab("View Results"):
-                gr.Markdown("""
-                ## View Evaluation Results
-                *Evaluation metrics by Kuldeep Choksi*
+                gr.Markdown("## Evaluation Results\n*Developed by Kuldeep Choksi*")
                 
-                Examine the performance metrics and visualizations from trained models.
-                
-                ---
-                """)
-                
-                gr.Markdown("### Step 1: Select a Model")
                 with gr.Row():
-                    results_checkpoint = gr.Dropdown(
-                        choices=get_available_checkpoints(),
-                        label="Select Model to Evaluate"
-                    )
-                    refresh_results_btn = gr.Button("Refresh List", variant="secondary")
-                
-                gr.Markdown("### Step 2: Run Evaluation")
-                gr.Markdown("""
-                Click the button below to run evaluation on the test set. 
-                This will compute AUROC and generate visualizations.
-                """)
+                    results_checkpoint = gr.Dropdown(choices=get_available_checkpoints("all"), label="Select Model")
+                    results_refresh_btn = gr.Button("Refresh", variant="secondary")
                 
                 with gr.Row():
                     run_eval_btn = gr.Button("Run Evaluation", variant="primary")
                     view_results_btn = gr.Button("View Existing Results", variant="secondary")
                 
-                eval_status = gr.Textbox(
-                    label="Evaluation Status",
-                    lines=15,
-                    value="Select a model and click 'Run Evaluation' to generate metrics.\n\nOr click 'View Existing Results' if you've already run evaluation."
-                )
-                
-                gr.Markdown("### Step 3: View Results")
+                eval_status = gr.Textbox(label="Evaluation Status", lines=15)
                 results_summary = gr.Textbox(label="Results Summary", lines=8)
                 
                 with gr.Row():
                     roc_image = gr.Image(label="ROC Curve")
                     dist_image = gr.Image(label="Score Distribution")
                 
-                recon_image = gr.Image(label="Sample Reconstructions")
+                recon_image = gr.Image(label="Sample Visualizations")
                 
-                # Wire up callbacks
-                refresh_results_btn.click(
-                    fn=lambda: gr.Dropdown(choices=get_available_checkpoints()),
-                    outputs=results_checkpoint
-                )
-                run_eval_btn.click(
-                    fn=on_run_evaluation,
-                    inputs=results_checkpoint,
-                    outputs=[eval_status, roc_image, dist_image, recon_image, results_summary]
-                )
-                view_results_btn.click(
-                    fn=on_view_results,
-                    inputs=results_checkpoint,
-                    outputs=[roc_image, dist_image, recon_image, results_summary]
-                )
+                results_refresh_btn.click(fn=lambda: gr.Dropdown(choices=get_available_checkpoints("all")), outputs=results_checkpoint)
+                run_eval_btn.click(fn=on_run_evaluation, inputs=results_checkpoint, outputs=[eval_status, roc_image, dist_image, recon_image, results_summary])
+                view_results_btn.click(fn=on_view_results, inputs=results_checkpoint, outputs=[roc_image, dist_image, recon_image, results_summary])
             
             # =================================================================
-            # TAB 4: HELP
+            # TAB 6: HELP
             # =================================================================
             with gr.Tab("Help"):
                 gr.Markdown("""
@@ -720,183 +770,66 @@ def create_ui():
                 
                 ---
                 
-                ### What is Anomaly Detection?
+                ### Image Anomaly Detection
                 
-                Anomaly detection identifies data points that differ significantly from the majority.
-                In manufacturing, this means finding defects in products without needing examples of
-                every possible defect type.
+                Train on normal images, detect defects as reconstruction failures.
                 
-                **How it works:**
-                1. Train a model on ONLY normal (defect-free) images
-                2. The model learns to reconstruct normal patterns
-                3. When shown a defective image, reconstruction fails
-                4. High reconstruction error = anomaly detected
+                **Folder structure for custom image datasets:**
+                ```
+                data/your_category/
+                    train/good/          (normal images)
+                    test/good/           (normal test images)
+                    test/defect_type/    (defective images)
+                ```
                 
                 ---
                 
-                ### Using Your Own Dataset
+                ### Video Anomaly Detection
                 
-                You can train on your own images! Follow this folder structure:
+                Train on normal video sequences, detect temporal anomalies.
                 
+                **Folder structure for custom video datasets:**
                 ```
-                data/
-                    your_category_name/
-                        train/
-                            good/
-                                image001.png
-                                image002.png
-                                ... (all your NORMAL images)
-                        test/
-                            good/
-                                normal_test_001.png
-                                ... (normal test images)
-                            defect_type_1/
-                                defect_001.png
-                                ... (images with this defect)
-                            defect_type_2/
-                                another_defect_001.png
-                                ...
-                        ground_truth/  (optional)
-                            defect_type_1/
-                                defect_001_mask.png
-                            defect_type_2/
-                                another_defect_001_mask.png
+                data/your_category/
+                    train/normal/
+                        video_001.mp4    (or folder of frames)
+                        video_002.mp4
+                    test/normal/
+                        test_001.mp4
+                    test/anomaly/
+                        anomaly_001.mp4
                 ```
                 
-                **Step-by-step for custom data:**
-                
-                1. Create folder: `data/my_product/`
-                2. Create `data/my_product/train/good/` and put ALL your normal images there
-                3. Create `data/my_product/test/good/` with some normal test images
-                4. Create `data/my_product/test/defect_name/` for each defect type with defective images
-                5. Restart the app - your category will appear in the dropdown
-                6. Train and evaluate!
-                
-                **Example for optical fiber inspection:**
-                ```
-                data/
-                    optical_fiber/
-                        train/
-                            good/
-                                fiber_001.png
-                                fiber_002.png
-                                ... (500+ normal fiber images)
-                        test/
-                            good/
-                                fiber_test_001.png (normal samples)
-                            crack/
-                                fiber_crack_001.png
-                            contamination/
-                                fiber_dirty_001.png
-                ```
-                
-                **Tips for best results:**
-                - Use at least 100+ training images (more is better)
-                - Keep lighting and positioning consistent
-                - Training images must be DEFECT-FREE
-                - Test images should include both normal and defective samples
-                - Image formats: PNG, JPG, JPEG
-                - Images will be resized to 256x256 automatically
+                **IPAD Dataset:** Pre-formatted industrial video data in `data/IPAD/`
                 
                 ---
                 
                 ### Interpreting Results
                 
-                **AUROC (Area Under ROC Curve):**
-                - 0.5 = Random guessing
-                - 0.7-0.8 = Acceptable
-                - 0.8-0.9 = Good
-                - 0.9+ = Excellent
-                
-                **Anomaly Score:**
-                - Lower = More normal
-                - Higher = More anomalous
-                - Compare to threshold to make decisions
-                
-                **Error Heatmap:**
-                - Red/Yellow = High reconstruction error
-                - Dark = Low reconstruction error
-                - Anomalies show as bright spots
-                
-                ---
-                
-                ### Troubleshooting
-                
-                **My category doesn't appear in dropdown:**
-                - Check folder structure matches the format above
-                - Make sure `train/good/` folder exists with images
-                - Restart the app after adding new data
-                
-                **No checkpoints available:**
-                - Train a model first in the 'Train Model' tab
-                
-                **Training is slow:**
-                - Reduce batch size
-                - Reduce number of epochs
-                - Ensure you're using GPU (check terminal output)
-                
-                **Poor detection results (low AUROC):**
-                - Train for more epochs (try 100+)
-                - Add more training images
-                - Ensure training images are truly defect-free
-                - Some defect types are inherently harder to detect
-                
-                **Out of memory:**
-                - Reduce batch size to 4 or 8
-                - Close other applications
-                
-                ---
-                
-                ### File Locations
-                
-                - **Your datasets:** `./data/<category_name>/`
-                - **Trained models:** `./results/<category>_<timestamp>/`
-                - **Evaluation outputs:** `./results/<category>_<timestamp>/evaluation/`
-                
-                ---
-                
-                ### Command Line Usage
-                
-                You can also run training and evaluation from the terminal:
-                
-                ```bash
-                # Train on custom dataset
-                python train.py --category optical_fiber --data-dir ./data --epochs 100
-                
-                # Train on MVTec dataset
-                python train.py --category bottle --data-dir ./data/original --epochs 50
-                
-                # Evaluate  
-                python evaluate.py --checkpoint results/optical_fiber_xxx/best_model.pth --data-dir ./data
-                ```
+                - **AUROC**: 0.5 = random, 0.7-0.8 = good, 0.9+ = excellent
+                - **Separation Ratio**: Higher = better anomaly detection
+                - **Error Heatmap**: Red/yellow = high error = potential anomaly
                 
                 ---
                 
                 ### About
                 
-                This anomaly detection system was developed by **Kuldeep Choksi** as part of 
-                a computer vision portfolio project. The system uses convolutional autoencoders 
-                to learn normal patterns and detect manufacturing defects.
+                Developed by **Kuldeep Choksi** as a computer vision portfolio project.
                 
-                **Technical Stack:**
-                - PyTorch for deep learning
-                - Gradio for the user interface
-                - MVTec AD dataset for benchmarking
+                **Results:**
+                - Image: 0.89 AUROC on MVTec bottles
+                - Video: 0.85 AUROC on IPAD R01
                 
-                **Contact:** [GitHub](https://github.com/KuldeepChoksi)
+                [GitHub](https://github.com/KuldeepChoksi)
                 """)
         
-        # Footer
-        gr.Markdown("""
-        ---
-        *Anomaly Detection System | Developed by Kuldeep Choksi | Built with PyTorch and Gradio*
-        """)
+        gr.Markdown("---\n*Anomaly Detection System | Developed by Kuldeep Choksi | Built with PyTorch and Gradio*")
     
     return app
 
 
 # ============================================================================
-# MAIN ENTRY POINT
+# MAIN
 # ============================================================================
 
 if __name__ == "__main__":
@@ -906,15 +839,9 @@ if __name__ == "__main__":
     print("="*60)
     print()
     print("Starting application...")
-    print()
-    print("Once loaded, open your browser to: http://localhost:7860")
-    print()
-    print("Press Ctrl+C to stop the server.")
+    print("Open: http://localhost:7860")
+    print("Press Ctrl+C to stop")
     print("="*60)
     
     app = create_ui()
-    app.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False
-    )
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False)
